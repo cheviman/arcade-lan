@@ -368,6 +368,14 @@ static link_member *link_member_of(lan_device *device, uint32_t id)
 	return NULL;
 }
 
+/* A player's input's bytes in lockstep, within a slot's (none linked) */
+static int input_width(const lan_device *device)
+{
+	const int bytes = device->config.input_bytes;
+
+	return linked(device) || bytes < 0 ? 0 : (bytes > SLOT_BYTES ? SLOT_BYTES : bytes);
+}
+
 /* The host: a device off the room's list (LAN_LINK: gone from the game too) */
 static void remove_member(lan_device *device, int index)
 {
@@ -605,7 +613,7 @@ static void send_input(lan_device *device)
 {
 	writer out;
 	uint32_t from = device->whole > device->given ? device->given : device->whole;
-	const int bytes = device->config.input_bytes;
+	const int bytes = input_width(device);
 
 	if (device->given - from > SENT_MOST)
 		from = device->given - SENT_MOST;
@@ -633,7 +641,7 @@ static void send_frames(lan_device *device, const member *to)
 {
 	writer out;
 	uint32_t from = to->have, until;
-	const int bytes = device->config.input_bytes;
+	const int bytes = input_width(device);
 
 	if (from + WINDOW < device->whole)
 		from = device->whole - WINDOW;    /* (a device that far behind has lost the game) */
@@ -978,7 +986,7 @@ static void heard_input(lan_device *device, reader *in, member *who)
 	const uint32_t have = get32(in);
 	const uint32_t from = get32(in);
 	const int count = (int)get8(in);
-	const int bytes = device->config.input_bytes;
+	const int bytes = input_width(device);
 	uint8_t inputs[SENT_MOST][LAN_PLAYERS * SLOT_BYTES];
 	bool hash_known;
 
@@ -1012,7 +1020,7 @@ static void heard_frames(lan_device *device, reader *in)
 	const uint8_t waiting_for = (uint8_t)get8(in);
 	const uint32_t from = get32(in);
 	const int count = (int)get8(in);
-	const int bytes = device->config.input_bytes;
+	const int bytes = input_width(device);
 
 	if (device->role != LAN_PLAYING || serial != device->serial || count > SENT_MOST)
 		return;
@@ -1128,7 +1136,7 @@ static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size,
 			return;
 		device->members[index].heard = device->clock;
 		device->members[index].address = from;
-		if (kind == PACKET_INPUT)
+		if (kind == PACKET_INPUT && !linked(device))
 			heard_input(device, &in, &device->members[index]);
 		else if (kind == PACKET_LEAVE)
 			heard_leave(device, index);
@@ -1197,7 +1205,8 @@ static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size,
 				heard_start(device, &in);
 			break;
 		case PACKET_FRAMES:
-			heard_frames(device, &in);
+			if (!linked(device))
+				heard_frames(device, &in);
 			break;
 		case PACKET_BLOCK:
 			if (linked(device))
@@ -1565,7 +1574,7 @@ bool lan_game_started(lan_device *device, void *settings, size_t *size, int *fir
 void lan_give_inputs(lan_device *device, const uint8_t *inputs)
 {
 	frame_entry *entry;
-	const int bytes = device ? device->config.input_bytes : 0;
+	const int bytes = device ? input_width(device) : 0;
 
 	if (!device || device->role != LAN_PLAYING || device->given > device->next + (uint32_t)device->config.delay)
 		return;
@@ -1584,7 +1593,7 @@ void lan_give_inputs(lan_device *device, const uint8_t *inputs)
 bool lan_next_frame(lan_device *device, uint8_t *inputs)
 {
 	const frame_entry *entry;
-	const int bytes = device ? device->config.input_bytes : 0;
+	const int bytes = device ? input_width(device) : 0;
 
 	if (!device || device->role != LAN_PLAYING || device->next >= device->whole)
 		return false;
