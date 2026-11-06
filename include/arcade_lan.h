@@ -2,24 +2,34 @@
  *    Name:        arcade_lan.h
  *    Description: a game over the local network: rooms of up to four devices, found by their beacons, and their game
  *                 played in lockstep through the room's host (every device runs the same frames with every player's
- *                 inputs)
- *    Version:     0.1.0
+ *                 inputs), or linked (each device runs its own game and sends the others a block of its own each
+ *                 frame, as linked cabinets do)
+ *    Version:     0.2.0
  *    Created:     06-11-2026
  *    Modified:    06-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
- *    No game in it: a game gives its players' controls as a few bytes a frame and runs its frames with the inputs the
- *    library hands back, which are every device's the same; the game's own state, the same on every device from the
- *    same start and the same inputs (a deterministic program), tells by its hash a device gone out of step.
- *
- *    A port's loop, each frame of its own:
+ *    No game in it. In lockstep (LAN_LOCKSTEP) a game gives its players' controls as a few bytes a frame and runs its
+ *    frames with the inputs the library hands back, which are every device's the same; the game's own state, the same
+ *    on every device from the same start and the same inputs (a deterministic program), tells by its hash a device
+ *    gone out of step. A port's loop, each frame of its own:
  *        lan_update(device);
  *        in a room: its menus (lan_members; the host's lan_start)
  *        lan_game_started(device, ...): the game started from its settings, this device's players from first_slot
  *        in the game: lan_give_inputs(device, its players' controls);
  *                     if (lan_next_frame(device, inputs)) run a frame with them, lan_frame_hash(device, frame, hash);
  *                     else show the last picture again (it holds: lan_waiting says for whom)
+ *
+ *    Linked (LAN_LINK, the arcade's linked cabinets: OutRunners') each device runs its own game and publishes a block
+ *    of its own each frame (what a link board would carry: its players' records), which goes straight to every other
+ *    device of the game; each one keeps every other's newest, and nothing waits frame by frame. A device unheard for a
+ *    third of a second shows as unheard (the game may wait for it), and after 3 seconds it is gone for the rest of the
+ *    game; the room's host gone, the next device of its list hosts the room on. The room takes devices while its game
+ *    goes on, and its host's START starts another (the game's next race) with the room's devices then:
+ *        lan_update(device); lan_set_status(device, what the game says of it, as its being in a race);
+ *        lan_game_started(device, ...): the game linked, this device the game's device of its own (lan_game_members)
+ *        in the game: lan_publish(device, its block); lan_block(device, n, block): the newest of the game's device n
  */
 #ifndef ARCADE_LAN_H
 #define ARCADE_LAN_H
@@ -39,6 +49,13 @@ extern "C" {
 #define LAN_ROOMS           8      /* the rooms a search keeps */
 #define LAN_SETTINGS_MOST   256    /* the game's settings a START carries, at most */
 #define LAN_DELAY_MOST      8
+#define LAN_BLOCK_MOST      1024   /* LAN_LINK: a device's block, at most */
+
+typedef enum
+{
+	LAN_LOCKSTEP,          /* every device runs the same frames with every player's inputs, through the host */
+	LAN_LINK               /* each device runs its own game and sends the others a block of its own each frame */
+} lan_mode;
 
 /* The game's: devices of another game or version are not heard */
 typedef struct
@@ -46,10 +63,11 @@ typedef struct
 	char game[4];          /* its four letters ("TMNT") */
 	uint8_t version;
 	uint16_t beacon_port;  /* where the rooms' beacons go: every device of the game looks there */
-	int input_bytes;       /* a player's input's bytes, 1 to LAN_INPUT_BYTES */
-	int delay;             /* the frames between a device's input and the frame it plays at, 1 to LAN_DELAY_MOST
-	                          (2 or 3 on a LAN: the datagrams have come by then) */
+	int input_bytes;       /* LAN_LOCKSTEP: a player's input's bytes, 1 to LAN_INPUT_BYTES */
+	int delay;             /* LAN_LOCKSTEP: the frames between a device's input and the frame it plays at, 1 to
+	                          LAN_DELAY_MOST (2 or 3 on a LAN: the datagrams have come by then) */
 	int loss;              /* for tests: the percent of its datagrams this device loses as it sends them */
+	lan_mode mode;         /* LAN_LOCKSTEP unless given */
 } lan_config;
 
 typedef struct lan_device lan_device;
@@ -88,8 +106,9 @@ typedef struct
 	int players;           /* its local players */
 	int first_slot;        /* the slot its first player takes: the players take them in the list's order */
 	bool heard;            /* in the last third of a second (this device always) */
-	bool gone;             /* its game's slots' inputs none from then on */
+	bool gone;             /* its game's slots' inputs none from then on (LAN_LINK: out of the game) */
 	bool own;              /* this device */
+	uint8_t status;        /* LAN_LINK: what it says of itself (lan_set_status) */
 } lan_member;
 
 /* A device on the network, 'name' its player's (or its own) and 'players' its local players (1 to LAN_PLAYERS): NULL
@@ -143,6 +162,20 @@ bool lan_waiting(const lan_device *device, char name[LAN_NAME_LENGTH + 1]);
 /* The device's socket's port, and a room joined by its host's address (where no beacon comes: tests, some networks) */
 uint16_t lan_port(const lan_device *device);
 lan_room lan_room_at(lan_address host);
+
+/* LAN_LINK: a byte of this device's own that the others see (lan_member's status): what the game says of it */
+void lan_set_status(lan_device *device, uint8_t status);
+
+/* LAN_LINK: the game's devices, as its START listed them (in the room's order then: the host first); who of them is
+   heard, who is gone */
+int lan_game_members(const lan_device *device, lan_member members[LAN_DEVICES]);
+
+/* LAN_LINK: this device's block (at most LAN_BLOCK_MOST bytes) to every other device of the game, at once */
+void lan_publish(lan_device *device, const void *block, size_t size);
+
+/* LAN_LINK: the newest block of the game's device 'index' (lan_game_members' order) into 'block' (LAN_BLOCK_MOST
+   bytes): its size, 0 while none has come */
+size_t lan_block(const lan_device *device, int index, void *block);
 
 #ifdef __cplusplus
 }

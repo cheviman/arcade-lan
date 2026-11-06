@@ -1,5 +1,5 @@
-# arcade-lan: a game over the local network (rooms, and lockstep through the room's host), for the ports of the
-# decompiled arcade games; a port adds it (add_subdirectory) and links arcade_lan
+# arcade-lan: a game over the local network (rooms, and a game in lockstep through the room's host or linked), for
+# the ports of the decompiled arcade games; a port adds it (add_subdirectory) and links arcade_lan
 cmake_minimum_required(VERSION 3.16)
 project(arcade_lan C)
 
@@ -16,11 +16,14 @@ else()
 	target_compile_options(arcade_lan PRIVATE -Wall -Wextra)
 endif()
 
-# The library's own test (three devices over 127.0.0.1): only when it is the project built, not a port's part
+# The library's own tests (devices over 127.0.0.1: lockstep, linked): only when it is the project built, not a
+# port's part
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-	add_executable(lan_test tests/lan_test.c)
-	target_link_libraries(lan_test PRIVATE arcade_lan)
-	set_target_properties(lan_test PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
 	enable_testing()
-	add_test(NAME lan_test COMMAND lan_test)
+	foreach(test lan_test lan_link_test)
+		add_executable(${test} tests/${test}.c)
+		target_link_libraries(${test} PRIVATE arcade_lan)
+		set_target_properties(${test} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+		add_test(NAME ${test} COMMAND ${test})
+	endforeach()
 endif()

@@ -1,16 +1,17 @@
 /**
  *    Name:        lan.c
- *    Description: the rooms (a host's beacons, JOIN, the room's list) and the game in lockstep through the host
- *    Version:     0.1.0
+ *    Description: the rooms (a host's beacons, JOIN, the room's list) and the game, in lockstep through the host or
+ *                 linked (each device's block to every other)
+ *    Version:     0.2.0
  *    Created:     06-11-2026
  *    Modified:    06-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
  *    The rooms are outrunners-port's (console/network.c): a host's beacon to the network every half second, JOIN asked
- *    until the host's list has the device, the list sent by the host, a device unheard for a third of a second waited
- *    for and after 3 seconds gone. Every datagram is written byte by byte, little-endian, so that the devices need not
- *    be alike.
+ *    until the host's list has the device, the list sent by the host (with where it hears each device, and what each
+ *    says of itself), a device unheard for a third of a second waited for and after 3 seconds gone. Every datagram is
+ *    written byte by byte, little-endian, so that the devices need not be alike.
  *
  *    The game: at its START every device runs frame 0 on, each frame only once it has every slot's inputs for it. A
  *    device's players' controls given at a frame play 'delay' frames on (the first 'delay' frames have none); it sends
@@ -19,6 +20,13 @@
  *    every device the frames it has not had yet (FRAMES). A frame can be put together only once every device has
  *    given its inputs for it, and a device gives them only as it runs its frames: no device is more than 'delay' and
  *    a datagram's frames apart from the others, and a ring of RING frames holds them all.
+ *
+ *    Linked (LAN_LINK): the START lists the game's devices (the room's then); each one answers it with a BLOCK, and
+ *    sends its block to every other of the game (BLOCK) each time the game publishes one, to where the room's list
+ *    says the host hears it until it hears that device itself (each one at the address first heard from it then). A
+ *    device keeps every other's newest block; one unheard for 3 seconds (or that leaves) is gone for the rest of the
+ *    game. The room takes devices while the game goes on, and the host's START starts another. The room's host gone
+ *    (unheard for 3 seconds, or its LEAVE), each device takes it off its list, and the next one hosts the room on.
  */
 #include "arcade_lan.h"
 #include "lan_udp.h"
@@ -27,7 +35,7 @@
 #include <string.h>
 #include <time.h>
 
-#define PROTOCOL            1          /* the library's datagrams: another's are not heard */
+#define PROTOCOL            2          /* the library's datagrams: another's are not heard */
 #define BEACON_FRAMES       30         /* a room's beacon, every half second */
 #define LIST_FRAMES         30         /* and its list, to its devices */
 #define ROOM_FORGOTTEN      180        /* a room unheard for 3 seconds is gone from the rooms found */
@@ -48,9 +56,10 @@ static const char *const ROOM_PLAYING = "ROOM PLAYING";
 static const char *const NO_ANSWER = "NO ANSWER";
 static const char *const HOST_GONE = "HOST GONE";
 static const char *const OUT_OF_STEP = "OUT OF STEP";
+static const char *const LEFT_OUT = "LEFT OUT";
 
 enum { PACKET_BEACON = 1, PACKET_JOIN, PACKET_LIST, PACKET_LEAVE, PACKET_REFUSED, PACKET_START, PACKET_INPUT,
-	PACKET_FRAMES };
+	PACKET_FRAMES, PACKET_BLOCK };
 enum { REFUSED_FULL = 1, REFUSED_PLAYING };
 
 #define MEMBER_GONE         0x01u      /* a LIST's member flags */
@@ -78,6 +87,7 @@ typedef struct
 	uint32_t heard;            /* the clock when last heard */
 	bool gone;
 	bool silent;               /* (a client's list: as the host hears it) */
+	uint8_t status;            /* what it says of itself (LAN_LINK) */
 	/* the host's, in the game */
 	uint32_t have;             /* the frames it has whole: [0, have) */
 	uint8_t answered;          /* the START it answered */
@@ -85,6 +95,23 @@ typedef struct
 	uint32_t hash_frame;
 	uint64_t hash;
 } member;
+
+/* LAN_LINK: a device of the game, as its START listed it */
+typedef struct
+{
+	uint32_t id;
+	char name[LAN_NAME_LENGTH + 1];
+	int players;
+	int first_slot;
+	lan_address address;       /* where its blocks go */
+	bool direct;               /* heard from that address itself (else the room's list's) */
+	uint32_t heard;
+	bool gone;                 /* unheard for 3 seconds, or left: for the rest of the game */
+	uint8_t status;
+	uint8_t answered;          /* (the host's) the START it answered */
+	size_t block_size;         /* its newest block's: 0 while none has come */
+	uint8_t block[LAN_BLOCK_MOST];
+} link_member;
 
 struct lan_device
 {
@@ -131,6 +158,11 @@ struct lan_device
 	bool hash_known;
 	bool out_of_step;
 	uint8_t waiting_for;       /* the member the frames wait for (NOBODY) */
+
+	/* LAN_LINK */
+	uint8_t status;            /* what this device says of itself */
+	link_member game[LAN_DEVICES];    /* the game's devices, as its START listed them */
+	int game_count;
 };
 
 /* ---- bytes ---- */
@@ -313,12 +345,42 @@ static void leave_room(lan_device *device, lan_role role)
 	device->role = role;
 	device->room = 0;
 	device->member_count = 0;
+	device->game_count = 0;
 	device->waiting_for = NOBODY;
 }
 
 static void set_problem(lan_device *device, const char *problem)
 {
 	device->problem = problem;
+}
+
+static bool linked(const lan_device *device)
+{
+	return device->config.mode == LAN_LINK;
+}
+
+/* LAN_LINK: the game's device of id 'id', or NULL */
+static link_member *link_member_of(lan_device *device, uint32_t id)
+{
+	for (int index = 0; index < device->game_count; index++)
+		if (device->game[index].id == id)
+			return &device->game[index];
+	return NULL;
+}
+
+/* The host: a device off the room's list (LAN_LINK: gone from the game too) */
+static void remove_member(lan_device *device, int index)
+{
+	link_member *was = linked(device) ? link_member_of(device, device->members[index].id) : NULL;
+
+	if (was)
+		was->gone = true;
+	memmove(&device->members[index], &device->members[index + 1],
+		(size_t)(device->member_count - index - 1) * sizeof(member));
+	device->member_count--;
+	give_slots(device);
+	device->list_version++;
+	device->list_changed = true;
 }
 
 /* ---- the game's frames ---- */
@@ -465,11 +527,24 @@ static void send_beacon(lan_device *device)
 	put_name(&out, device->name);
 	put8(&out, (uint32_t)device->member_count);
 	put8(&out, (uint32_t)room_players(device));
-	put8(&out, device->role == LAN_PLAYING ? 1u : 0u);
+	put8(&out, device->role == LAN_PLAYING && !linked(device) ? 1u : 0u);    /* (a linked room takes devices) */
 	send_datagram(device, everyone, &out);
 	send_datagram(device, this_one, &out);
 }
 
+/* JOIN: asked of a room's host, and again while in it (heard by it, with what this device says of itself) */
+static void send_join(lan_device *device)
+{
+	writer out;
+
+	put_header(device, &out, PACKET_JOIN);
+	put_name(&out, device->name);
+	put8(&out, (uint32_t)device->players);
+	put8(&out, device->status);
+	send_datagram(device, device->host_address, &out);
+}
+
+/* The host: its list, each device with where the host hears it and what it says of itself */
 static void send_list(lan_device *device)
 {
 	writer out;
@@ -486,6 +561,9 @@ static void send_list(lan_device *device)
 		put8(&out, (uint32_t)who->players);
 		put8(&out, (who->gone ? MEMBER_GONE : 0u)
 			| (index && device->clock - who->heard > SILENT_FRAMES ? MEMBER_SILENT : 0u));
+		put32(&out, index ? who->address.ip : 0u);
+		put16(&out, index ? who->address.port : 0u);
+		put8(&out, index ? who->status : device->status);
 	}
 	for (int index = 1; index < device->member_count; index++)
 		if (!device->members[index].gone)
@@ -501,22 +579,25 @@ static void send_refused(lan_device *device, lan_address to, int reason)
 	send_datagram(device, to, &out);
 }
 
-static void send_start(lan_device *device, const member *to)
+/* The host's START: the game's devices (the room's; LAN_LINK: as the game listed them, whatever the room's list is
+   now) and its settings */
+static void send_start(lan_device *device, lan_address to)
 {
 	writer out;
+	const int count = linked(device) ? device->game_count : device->member_count;
 
 	put_header(device, &out, PACKET_START);
 	put8(&out, device->serial);
-	put8(&out, (uint32_t)device->member_count);
-	for (int index = 0; index < device->member_count; index++)
+	put8(&out, (uint32_t)count);
+	for (int index = 0; index < count; index++)
 	{
-		put32(&out, device->members[index].id);
-		put8(&out, (uint32_t)device->members[index].players);
+		put32(&out, linked(device) ? device->game[index].id : device->members[index].id);
+		put8(&out, (uint32_t)(linked(device) ? device->game[index].players : device->members[index].players));
 	}
 	put16(&out, (uint32_t)device->settings_size);
 	for (size_t at = 0; at < device->settings_size; at++)
 		put8(&out, device->settings[at]);
-	send_datagram(device, to->address, &out);
+	send_datagram(device, to, &out);
 }
 
 /* A client: its players' inputs the host has not put together yet, the frames it has, its last hash */
@@ -582,6 +663,106 @@ static void send_leave(lan_device *device, lan_address to)
 	send_datagram(device, to, &out);
 }
 
+/* ---- the linked game (LAN_LINK) ---- */
+
+/* A block to a device of the game (none: the START answered) */
+static void send_block(lan_device *device, const link_member *to, const uint8_t *block, size_t size)
+{
+	writer out;
+
+	if (!to->address.ip)
+		return;
+	put_header(device, &out, PACKET_BLOCK);
+	put8(&out, device->serial);
+	put8(&out, device->status);
+	put16(&out, (uint32_t)size);
+	for (size_t at = 0; at < size; at++)
+		put8(&out, block[at]);
+	send_datagram(device, to->address, &out);
+}
+
+/* The game linked: its devices the START's ('ids' and their 'players', in its order), their names, where they are
+   heard and what they say of themselves as the room's list has them */
+static void start_link(lan_device *device, const uint32_t *ids, const int *players, int count)
+{
+	int slot = 0;
+
+	memset(device->game, 0, sizeof(device->game));
+	device->game_count = count;
+	device->first_slot = 0;
+	for (int index = 0; index < count; index++)
+	{
+		link_member *each = &device->game[index];
+		const int known = member_index(device, ids[index]);
+
+		each->id = ids[index];
+		each->players = players[index];
+		each->first_slot = slot;
+		slot += players[index];
+		each->heard = device->clock;
+		if (known >= 0)
+		{
+			memcpy(each->name, device->members[known].name, sizeof(each->name));
+			each->address = device->members[known].address;
+			each->status = device->members[known].status;
+		}
+		if (each->id == device->id)
+		{
+			each->answered = device->serial;
+			device->first_slot = each->first_slot;
+		}
+	}
+	device->waiting_for = NOBODY;
+	device->started_new = true;
+	device->role = LAN_PLAYING;
+}
+
+/* The game's devices unheard for 3 seconds: gone for the rest of the game */
+static void link_frame(lan_device *device)
+{
+	for (int index = 0; index < device->game_count; index++)
+	{
+		link_member *each = &device->game[index];
+
+		if (each->id != device->id && !each->gone && device->clock - each->heard > LOST_FRAMES)
+			each->gone = true;
+	}
+}
+
+/* A device of the room: its host gone, off its list (and out of the game), the next one hosts the room on (this
+   one, or the one the room is heard from then): false where none is left that it can reach */
+static bool take_over(lan_device *device)
+{
+	link_member *was = link_member_of(device, device->members[0].id);
+
+	if (was)
+		was->gone = true;
+	memmove(&device->members[0], &device->members[1], (size_t)(device->member_count - 1) * sizeof(member));
+	device->member_count--;
+	if (device->member_count == 0 || (device->members[0].id != device->id && !device->members[0].address.ip))
+		return false;
+	for (int index = 0; index < device->member_count; index++)
+		device->members[index].heard = device->clock;
+	give_slots(device);
+	if (device->members[0].id == device->id)
+	{
+		device->list_version++;
+		device->list_changed = true;
+		for (int index = 0; index < device->game_count; index++)
+			device->game[index].answered = device->serial;    /* (its START had come from the host gone) */
+		send_beacon(device);
+	}
+	else
+	{
+		/* (where this device hears it itself, its blocks', before where the host gone heard it) */
+		const link_member *next = link_member_of(device, device->members[0].id);
+
+		device->host_address = next && next->direct ? next->address : device->members[0].address;
+		device->members[0].address = device->host_address;
+	}
+	return true;
+}
+
 /* ---- what comes ---- */
 
 /* A room's beacon, while looking for rooms */
@@ -616,9 +797,11 @@ static void heard_join(lan_device *device, reader *in, uint32_t sender, lan_addr
 {
 	char name[LAN_NAME_LENGTH + 1];
 	int players, index;
+	uint8_t status;
 
 	get_name(in, name);
 	players = (int)get8(in);
+	status = (uint8_t)get8(in);
 	if (in->short_of || players < 1 || players > LAN_PLAYERS)
 		return;
 	index = member_index(device, sender);
@@ -626,15 +809,16 @@ static void heard_join(lan_device *device, reader *in, uint32_t sender, lan_addr
 	{
 		device->members[index].address = from;
 		device->members[index].heard = device->clock;
+		device->members[index].status = status;
 		device->list_changed = true;    /* (its JOIN again: the list it has not had) */
 		return;
 	}
-	if (device->role == LAN_PLAYING)
+	if (device->role == LAN_PLAYING && !linked(device))
 	{
 		send_refused(device, from, REFUSED_PLAYING);
 		return;
 	}
-	if (device->member_count == LAN_DEVICES || room_players(device) + players > LAN_PLAYERS)
+	if (device->member_count == LAN_DEVICES || (!linked(device) && room_players(device) + players > LAN_PLAYERS))
 	{
 		send_refused(device, from, REFUSED_FULL);
 		return;
@@ -646,6 +830,7 @@ static void heard_join(lan_device *device, reader *in, uint32_t sender, lan_addr
 	device->members[index].players = players;
 	device->members[index].address = from;
 	device->members[index].heard = device->clock;
+	device->members[index].status = status;
 	give_slots(device);
 	device->list_version++;
 	device->list_changed = true;
@@ -671,17 +856,25 @@ static void heard_list(lan_device *device, reader *in)
 		flags = (uint8_t)get8(in);
 		members[index].gone = (flags & MEMBER_GONE) != 0;
 		members[index].silent = (flags & MEMBER_SILENT) != 0;
+		members[index].address.ip = get32(in);
+		members[index].address.port = (uint16_t)get16(in);
+		members[index].status = (uint8_t)get8(in);
 		listed = listed || members[index].id == device->id;
 	}
 	if (in->short_of)
 		return;
 	if (!listed)
 	{
-		if (device->role == LAN_IN_ROOM)
-			leave_room(device, LAN_OFF);    /* (left out of its list) */
+		/* (left out of its list: LAN_LINK says so, its game going on alone) */
+		if (device->role == LAN_IN_ROOM || (linked(device) && device->role == LAN_PLAYING))
+		{
+			leave_room(device, LAN_OFF);
+			if (linked(device))
+				set_problem(device, LEFT_OUT);
+		}
 		return;
 	}
-	if (device->role == LAN_PLAYING)
+	if (device->role == LAN_PLAYING && !linked(device))
 	{
 		/* (the game's slots stay those of its START: of the list, who is gone or silent) */
 		for (int index = 0; index < count; index++)
@@ -715,7 +908,14 @@ static void heard_start(lan_device *device, reader *in)
 	size_t size;
 
 	if (device->role == LAN_PLAYING && serial == device->serial)
-		return;    /* (its START again: not answered yet) */
+	{
+		/* (its START again: not answered yet; LAN_LINK answers it once more) */
+		link_member *host = linked(device) && device->member_count > 0 ? link_member_of(device, device->members[0].id) : NULL;
+
+		if (host)
+			send_block(device, host, NULL, 0);
+		return;
+	}
 	if (count < 1 || count > LAN_DEVICES)
 		return;
 	memset(members, 0, sizeof(members));
@@ -731,6 +931,30 @@ static void heard_start(lan_device *device, reader *in)
 		device->settings[at] = (uint8_t)get8(in);
 	if (in->short_of || member_index(device, device->id) < 0)
 		return;
+	if (linked(device))
+	{
+		/* the game's devices, the room's list as it is (it takes devices while the game goes on) */
+		uint32_t ids[LAN_DEVICES];
+		int players[LAN_DEVICES];
+		bool listed = false;
+		link_member *host;
+
+		for (int index = 0; index < count; index++)
+		{
+			ids[index] = members[index].id;
+			players[index] = members[index].players < 1 || members[index].players > LAN_PLAYERS ? 1 : members[index].players;
+			listed = listed || ids[index] == device->id;
+		}
+		if (!listed)
+			return;
+		device->settings_size = size;
+		device->serial = serial;
+		start_link(device, ids, players, count);
+		host = link_member_of(device, device->members[0].id);
+		if (host)
+			send_block(device, host, NULL, 0);    /* (its answer) */
+		return;
+	}
 	for (int index = 0; index < count; index++)
 	{
 		const int known = member_index(device, members[index].id);
@@ -821,21 +1045,49 @@ static void heard_frames(lan_device *device, reader *in)
 	}
 }
 
-/* The host: a device leaves (out of the list in a room; gone in the game) */
+/* The host: a device leaves (out of the list in a room; gone in a game in lockstep; LAN_LINK: both) */
 static void heard_leave(lan_device *device, int index)
 {
-	if (device->role == LAN_PLAYING)
+	if (device->role == LAN_PLAYING && !linked(device))
 	{
 		device->members[index].gone = true;
 		device->list_changed = true;
 		return;
 	}
-	memmove(&device->members[index], &device->members[index + 1],
-		(size_t)(device->member_count - index - 1) * sizeof(member));
-	device->member_count--;
-	give_slots(device);
-	device->list_version++;
-	device->list_changed = true;
+	remove_member(device, index);
+}
+
+/* LAN_LINK: a device's block, or its answer to the START (none), straight from it: kept as its newest */
+static void heard_block(lan_device *device, reader *in, uint32_t sender, lan_address from)
+{
+	uint8_t block[LAN_BLOCK_MOST];
+	const uint8_t serial = (uint8_t)get8(in);
+	const uint8_t status = (uint8_t)get8(in);
+	const size_t size = get16(in);
+	const int index = member_index(device, sender);
+	link_member *who;
+
+	if (size > LAN_BLOCK_MOST)
+		return;
+	for (size_t at = 0; at < size; at++)
+		block[at] = (uint8_t)get8(in);
+	who = link_member_of(device, sender);
+	if (in->short_of || device->role != LAN_PLAYING || serial != device->serial || !who || who->gone)
+		return;
+	if (who->direct && (who->address.ip != from.ip || who->address.port != from.port))
+		return;    /* (its id from another address: not its) */
+	who->address = from;
+	who->direct = true;
+	who->heard = device->clock;
+	who->status = status;
+	who->answered = serial;
+	if (index >= 0)
+		device->members[index].status = status;
+	if (size > 0)
+	{
+		memcpy(who->block, block, size);
+		who->block_size = size;
+	}
 }
 
 static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size, lan_address from, bool beacon)
@@ -880,12 +1132,47 @@ static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size,
 			heard_input(device, &in, &device->members[index]);
 		else if (kind == PACKET_LEAVE)
 			heard_leave(device, index);
+		else if (kind == PACKET_BLOCK && linked(device))
+			heard_block(device, &in, sender, from);
 		return;
 	}
 	/* a client: only its host (joined by its address, its room as its first answer says) */
 	if (device->role == LAN_JOINING && device->room == 0 && from.ip == device->host_address.ip
 		&& from.port == device->host_address.port)
 		device->room = room;
+	/* LAN_LINK: the game's devices too, straight from each (a block; a LEAVE: gone at once); the host where its
+	   blocks come from, if that is not where the room's list said */
+	if (linked(device) && room == device->room && device->member_count > 0
+		&& (device->role == LAN_IN_ROOM || device->role == LAN_PLAYING))
+	{
+		link_member *who = link_member_of(device, sender);
+		const bool from_it = who && who->direct && who->address.ip == from.ip && who->address.port == from.port;
+
+		if (sender == device->members[0].id)
+		{
+			if (kind == PACKET_BLOCK)
+			{
+				/* (its block: where it comes from, the host's from then on) */
+				heard_block(device, &in, sender, from);
+				if (who && who->direct && who->address.ip == from.ip && who->address.port == from.port)
+				{
+					device->host_address = device->members[0].address = from;
+					device->members[0].heard = device->clock;
+				}
+				return;
+			}
+			if (from_it && (from.ip != device->host_address.ip || from.port != device->host_address.port))
+				device->host_address = device->members[0].address = from;
+		}
+		else
+		{
+			if (kind == PACKET_BLOCK)
+				heard_block(device, &in, sender, from);
+			else if (kind == PACKET_LEAVE && who && (!who->direct || from_it))
+				who->gone = true;
+			return;
+		}
+	}
 	if ((device->role != LAN_JOINING && device->role != LAN_IN_ROOM && device->role != LAN_PLAYING)
 		|| room != device->room || from.ip != device->host_address.ip || from.port != device->host_address.port)
 		return;
@@ -912,9 +1199,18 @@ static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size,
 		case PACKET_FRAMES:
 			heard_frames(device, &in);
 			break;
+		case PACKET_BLOCK:
+			if (linked(device))
+				heard_block(device, &in, sender, from);
+			break;
 		case PACKET_LEAVE:
-			leave_room(device, LAN_OFF);
-			set_problem(device, HOST_GONE);
+			if (linked(device) && device->member_count > 0)
+				device->members[0].heard = device->clock - LOST_FRAMES - 1u;    /* (gone at once: the next one hosts) */
+			else
+			{
+				leave_room(device, LAN_OFF);
+				set_problem(device, HOST_GONE);
+			}
 			break;
 		default:
 			break;
@@ -928,8 +1224,9 @@ lan_device *lan_open(const lan_config *config, const char *name, int players)
 	static uint32_t opened;
 	lan_device *device;
 
-	if (!config || config->input_bytes < 1 || config->input_bytes > LAN_INPUT_BYTES || config->delay < 1
-		|| config->delay > LAN_DELAY_MOST || players < 1 || players > LAN_PLAYERS)
+	if (!config || players < 1 || players > LAN_PLAYERS || (config->mode != LAN_LOCKSTEP && config->mode != LAN_LINK)
+		|| (config->mode == LAN_LOCKSTEP && (config->input_bytes < 1 || config->input_bytes > LAN_INPUT_BYTES
+		|| config->delay < 1 || config->delay > LAN_DELAY_MOST)))
 		return NULL;
 	device = (lan_device *)calloc(1, sizeof(*device));
 	if (!device)
@@ -1005,14 +1302,7 @@ void lan_update(lan_device *device)
 				set_problem(device, NO_ANSWER);
 			}
 			else if ((device->clock - device->joining_since) % JOIN_FRAMES == 0)
-			{
-				writer out;
-
-				put_header(device, &out, PACKET_JOIN);
-				put_name(&out, device->name);
-				put8(&out, (uint32_t)device->players);
-				send_datagram(device, device->host_address, &out);
-			}
+				send_join(device);
 			break;
 		case LAN_IN_ROOM:
 		case LAN_PLAYING:
@@ -1020,22 +1310,21 @@ void lan_update(lan_device *device)
 			{
 				if (device->member_count > 0 && device->clock - device->members[0].heard > LOST_FRAMES)
 				{
-					leave_room(device, LAN_OFF);
-					set_problem(device, HOST_GONE);
+					/* (LAN_LINK: the next device of the list hosts the room on) */
+					if (!linked(device) || !take_over(device))
+					{
+						leave_room(device, LAN_OFF);
+						set_problem(device, HOST_GONE);
+					}
 					break;
 				}
-				if (device->role == LAN_PLAYING)
+				if (device->role == LAN_PLAYING && !linked(device))
 					send_input(device);
 				else if (device->clock % JOIN_FRAMES == 0)
-				{
-					writer out;    /* (in the room: heard by its host, its JOIN again, more often than a device
-					                  unheard is waited for) */
-
-					put_header(device, &out, PACKET_JOIN);
-					put_name(&out, device->name);
-					put8(&out, (uint32_t)device->players);
-					send_datagram(device, device->host_address, &out);
-				}
+					send_join(device);    /* (in the room: heard by its host, its JOIN again, more often than a
+					                         device unheard is waited for) */
+				if (device->role == LAN_PLAYING && linked(device))
+					link_frame(device);
 				break;
 			}
 			/* the host */
@@ -1045,7 +1334,7 @@ void lan_update(lan_device *device)
 
 				if (who->gone || device->clock - who->heard <= LOST_FRAMES)
 					continue;
-				if (device->role == LAN_PLAYING)
+				if (device->role == LAN_PLAYING && !linked(device))
 				{
 					who->gone = true;    /* (its slots none from the frames not yet whole) */
 					device->list_changed = true;
@@ -1063,7 +1352,18 @@ void lan_update(lan_device *device)
 				send_list(device);
 				device->list_changed = false;
 			}
-			if (device->role == LAN_PLAYING)
+			if (device->role == LAN_PLAYING && linked(device))
+			{
+				link_frame(device);
+				for (int index = 0; index < device->game_count; index++)
+				{
+					const link_member *who = &device->game[index];
+
+					if (who->id != device->id && !who->gone && who->answered != device->serial)
+						send_start(device, who->address);
+				}
+			}
+			else if (device->role == LAN_PLAYING)
 			{
 				put_frames_together(device);
 				for (int index = 1; index < device->member_count; index++)
@@ -1073,7 +1373,7 @@ void lan_update(lan_device *device)
 					if (who->gone)
 						continue;
 					if (who->answered != device->serial)
-						send_start(device, who);
+						send_start(device, who->address);
 					else
 						send_frames(device, who);
 				}
@@ -1161,14 +1461,7 @@ bool lan_join(lan_device *device, const lan_room *room)
 	device->member_count = 0;
 	device->joining_since = device->clock;
 	device->role = LAN_JOINING;
-	{
-		writer out;
-
-		put_header(device, &out, PACKET_JOIN);
-		put_name(&out, device->name);
-		put8(&out, (uint32_t)device->players);
-		send_datagram(device, device->host_address, &out);
-	}
+	send_join(device);
 	return true;
 }
 
@@ -1185,6 +1478,15 @@ void lan_leave(lan_device *device)
 	else if (device->role == LAN_JOINING || device->role == LAN_IN_ROOM || device->role == LAN_PLAYING)
 		for (int copy = 0; copy < LEAVE_COPIES; copy++)
 			send_leave(device, device->host_address);
+	if (linked(device) && device->role == LAN_PLAYING)
+	{
+		/* (the game's devices hear it too: gone at once) */
+		for (int copy = 0; copy < LEAVE_COPIES; copy++)
+			for (int index = 0; index < device->game_count; index++)
+				if (device->game[index].id != device->id && !device->game[index].gone && device->game[index].address.ip
+					&& (device->member_count == 0 || device->game[index].id != device->members[0].id))
+					send_leave(device, device->game[index].address);
+	}
 	if (device->role == LAN_SEARCHING)
 		stop_searching(device);
 	leave_room(device, LAN_OFF);
@@ -1205,6 +1507,7 @@ int lan_members(const lan_device *device, lan_member members[LAN_DEVICES])
 		members[index].first_slot = who->first_slot;
 		members[index].own = who->id == device->id;
 		members[index].gone = who->gone;
+		members[index].status = members[index].own ? device->status : who->status;
 		if (members[index].own)
 			members[index].heard = true;
 		else if (lan_hosting(device) || index == 0)
@@ -1217,14 +1520,30 @@ int lan_members(const lan_device *device, lan_member members[LAN_DEVICES])
 
 bool lan_start(lan_device *device, const void *settings, size_t size)
 {
-	if (!lan_hosting(device) || device->role != LAN_IN_ROOM || size > LAN_SETTINGS_MOST)
+	if (!lan_hosting(device) || size > LAN_SETTINGS_MOST
+		|| (device->role != LAN_IN_ROOM && !(linked(device) && device->role == LAN_PLAYING)))
 		return false;
 	device->serial++;
-	memcpy(device->settings, settings, size);
+	if (size)
+		memcpy(device->settings, settings, size);
 	device->settings_size = size;
-	start_game(device);
+	if (linked(device))
+	{
+		/* (another game while one goes on: the room's devices now) */
+		uint32_t ids[LAN_DEVICES];
+		int players[LAN_DEVICES];
+
+		for (int index = 0; index < device->member_count; index++)
+		{
+			ids[index] = device->members[index].id;
+			players[index] = device->members[index].players;
+		}
+		start_link(device, ids, players, device->member_count);
+	}
+	else
+		start_game(device);
 	for (int index = 1; index < device->member_count; index++)
-		send_start(device, &device->members[index]);
+		send_start(device, device->members[index].address);
 	send_beacon(device);    /* (its room playing now: JOIN shows it so) */
 	return true;
 }
@@ -1305,6 +1624,22 @@ uint32_t lan_frame_number(const lan_device *device)
 
 bool lan_waiting(const lan_device *device, char name[LAN_NAME_LENGTH + 1])
 {
+	if (device && device->role == LAN_PLAYING && linked(device))
+	{
+		/* (LAN_LINK: the first device of the game unheard for a third of a second, not yet gone) */
+		for (int index = 0; index < device->game_count; index++)
+		{
+			const link_member *who = &device->game[index];
+
+			if (who->id != device->id && !who->gone && device->clock - who->heard > SILENT_FRAMES)
+			{
+				if (name)
+					memcpy(name, who->name, LAN_NAME_LENGTH + 1);
+				return true;
+			}
+		}
+		return false;
+	}
 	if (!device || device->role != LAN_PLAYING || device->next < device->whole || device->waiting_for == NOBODY
 		|| device->waiting_for >= device->member_count)
 		return false;
@@ -1325,4 +1660,57 @@ lan_room lan_room_at(lan_address host)
 	memset(&room, 0, sizeof(room));
 	room.host = host;
 	return room;
+}
+
+/* ---- LAN_LINK's ---- */
+
+void lan_set_status(lan_device *device, uint8_t status)
+{
+	if (device)
+		device->status = status;
+}
+
+int lan_game_members(const lan_device *device, lan_member members[LAN_DEVICES])
+{
+	if (!device || !linked(device) || device->role != LAN_PLAYING)
+		return 0;
+	for (int index = 0; index < device->game_count; index++)
+	{
+		const link_member *who = &device->game[index];
+
+		memset(&members[index], 0, sizeof(members[index]));
+		members[index].id = who->id;
+		memcpy(members[index].name, who->name, sizeof(who->name));
+		members[index].players = who->players;
+		members[index].first_slot = who->first_slot;
+		members[index].own = who->id == device->id;
+		members[index].gone = who->gone;
+		members[index].heard = members[index].own || device->clock - who->heard <= SILENT_FRAMES;
+		members[index].status = members[index].own ? device->status : who->status;
+	}
+	return device->game_count;
+}
+
+void lan_publish(lan_device *device, const void *block, size_t size)
+{
+	link_member *own;
+
+	if (!device || !linked(device) || device->role != LAN_PLAYING || size > LAN_BLOCK_MOST
+		|| !(own = link_member_of(device, device->id)))
+		return;
+	if (size)
+		memcpy(own->block, block, size);
+	own->block_size = size;
+	own->status = device->status;
+	for (int index = 0; index < device->game_count; index++)
+		if (device->game[index].id != device->id && !device->game[index].gone)
+			send_block(device, &device->game[index], own->block, size);
+}
+
+size_t lan_block(const lan_device *device, int index, void *block)
+{
+	if (!device || !linked(device) || device->role != LAN_PLAYING || index < 0 || index >= device->game_count)
+		return 0;
+	memcpy(block, device->game[index].block, device->game[index].block_size);
+	return device->game[index].block_size;
 }
