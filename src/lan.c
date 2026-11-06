@@ -1026,9 +1026,10 @@ void lan_update(lan_device *device)
 				}
 				if (device->role == LAN_PLAYING)
 					send_input(device);
-				else if (device->clock % LIST_FRAMES == 0)
+				else if (device->clock % JOIN_FRAMES == 0)
 				{
-					writer out;    /* (in the room: heard by its host, its JOIN again) */
+					writer out;    /* (in the room: heard by its host, its JOIN again, more often than a device
+					                  unheard is waited for) */
 
 					put_header(device, &out, PACKET_JOIN);
 					put_name(&out, device->name);
