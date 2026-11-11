@@ -2,10 +2,10 @@
  *    Name:        lan_test.c
  *    Description: the library's test: three devices in one program over 127.0.0.1 (a host, one that finds its room by
  *                 its beacon, one that joins it by its address, with two players), a game of its own, a tenth of the
- *                 datagrams lost
- *    Version:     0.1.0
+ *                 datagrams lost; and a room found with no beacon heard, by a SEEK
+ *    Version:     0.2.0
  *    Created:     06-11-2026
- *    Modified:    06-11-2026
+ *    Modified:    11-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -13,8 +13,13 @@
  *    JOIN by it and by the address, the list, the slots), the same frames on every device, the frames held while a
  *    device is not heard and for whom, a device gone after 3 seconds (the others go on without it), a device out of
  *    step (its hash), the host gone.
+ *
+ *    The rooms found where no broadcast is heard: a host whose beacons go to a port the devices looking for rooms do
+ *    not listen at (what a device hears of them where the system refuses broadcasts), found by the device whose SEEK
+ *    it hears and not by the one that seeks at another port; and the addresses a sweep goes to (lan_udp.h's).
  */
 #include "arcade_lan.h"
+#include "../src/lan_udp.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -22,7 +27,12 @@
 
 #define DEVICES             3
 #define HISTORY             8192       /* each device's numbers, by frame */
-#define BEACON_PORT         27731
+#define BEACON_PORT         27731      /* (its seeks' port the next, the library's choice) */
+#define FAR_BEACON_PORT     27733      /* the room found by a SEEK: its beacons' port, */
+#define DEAF_BEACON_PORT    27734      /* the one the device that looks for it listens at, */
+#define SEEK_PORT           27735      /* its seeks' port; */
+#define OTHER_BEACON_PORT   27736      /* another device's, */
+#define NOBODYS_SEEK_PORT   27738      /* and the one it seeks at, where no host listens */
 #define INPUT_BYTES         2
 
 typedef struct
@@ -130,6 +140,70 @@ static bool same_frames(uint32_t frames)
 	return true;
 }
 
+/* A room found with no beacon heard, by a SEEK, and the addresses a sweep goes to */
+static void rooms_by_seek(void)
+{
+	const lan_config hosting = { { 'T', 'E', 'S', 'T' }, 1, FAR_BEACON_PORT, INPUT_BYTES, 3, 10, LAN_LOCKSTEP,
+		SEEK_PORT };
+	const lan_config seeking = { { 'T', 'E', 'S', 'T' }, 1, DEAF_BEACON_PORT, INPUT_BYTES, 3, 10, LAN_LOCKSTEP,
+		SEEK_PORT };
+	const lan_config apart = { { 'T', 'E', 'S', 'T' }, 1, OTHER_BEACON_PORT, INPUT_BYTES, 3, 10, LAN_LOCKSTEP,
+		NOBODYS_SEEK_PORT };
+	lan_device *host = lan_open(&hosting, "Far host", 1), *seeker = lan_open(&seeking, "Seeker", 1);
+	lan_device *other = lan_open(&apart, "Other", 1);
+	lan_room rooms[LAN_ROOMS], none[LAN_ROOMS];
+	lan_member members[LAN_DEVICES];
+	uint32_t first = 0, last = 0;
+	int found = 0, others = 0, ticks;
+
+	if (!host || !seeker || !other)
+	{
+		check(false, "the devices of the room found by a SEEK");
+		return;
+	}
+	check(lan_host(host), "a host whose beacons the others do not hear");
+	lan_search(seeker);
+	lan_search(other);
+	for (ticks = 0; ticks < 600; ticks++)
+	{
+		lan_update(host);
+		lan_update(seeker);
+		lan_update(other);
+		if (!found)
+			found = lan_rooms(seeker, rooms);
+		others += lan_rooms(other, none);
+	}
+	check(found == 1 && strcmp(rooms[0].name, "FAR HOST") == 0, "its room found by a SEEK, no beacon heard");
+	check(found == 1 && rooms[0].host.ip == 0x7F000001u && rooms[0].host.port == lan_port(host) && !rooms[0].playing,
+		"the room's host where its answer came from: its own socket");
+	check(lan_rooms(seeker, rooms) == 1, "the room kept while its host answers");
+	check(others == 0, "and no room for the device that seeks where no host listens");
+	if (found)
+		lan_join(seeker, &rooms[0]);
+	for (ticks = 0; ticks < 400 && (lan_role_of(seeker) != LAN_IN_ROOM || lan_members(host, members) != 2); ticks++)
+	{
+		lan_update(host);
+		lan_update(seeker);
+	}
+	check(lan_role_of(seeker) == LAN_IN_ROOM && lan_members(host, members) == 2, "JOIN, the room found so");
+	lan_close(other);
+	lan_close(seeker);
+	lan_close(host);
+
+	/* a sweep's addresses: 192.168.1.42/24, 10.1.2.42/8, 172.31.0.5/30, and those it has none for */
+	check(lan_udp_sweep_range(0xC0A8012Au, 0xFFFFFF00u, &first, &last) && first == 0xC0A80101u && last == 0xC0A801FEu,
+		"a sweep: a /24's addresses, but the network's own and its broadcast's");
+	check(lan_udp_sweep_range(0x0A01022Au, 0xFF000000u, &first, &last) && first == 0x0A010201u && last == 0x0A0102FEu,
+		"of a larger network, the /24 around the device");
+	check(lan_udp_sweep_range(0xAC1F0005u, 0xFFFFFFFCu, &first, &last) && first == 0xAC1F0005u && last == 0xAC1F0006u,
+		"of a smaller one, its own");
+	check(!lan_udp_sweep_range(0x08080808u, 0xFFFFFF00u, &first, &last)
+		&& !lan_udp_sweep_range(0xAC200001u, 0xFFFFFF00u, &first, &last)
+		&& !lan_udp_sweep_range(0xA9FE0001u, 0xFFFF0000u, &first, &last)
+		&& !lan_udp_sweep_range(0xC0A80101u, 0xFFFFFFFFu, &first, &last),
+		"none of a network that is not private, nor of an address alone");
+}
+
 int main(void)
 {
 	lan_config config = { { 'T', 'E', 'S', 'T' }, 1, BEACON_PORT, INPUT_BYTES, 3, 10 };
@@ -167,7 +241,7 @@ int main(void)
 		tick_all(1);
 		found = lan_rooms(searcher->lan, rooms);
 	}
-	check(found == 1 && strcmp(rooms[0].name, "HOST") == 0, "the room found by its beacon, its host's name");
+	check(found == 1 && strcmp(rooms[0].name, "HOST") == 0, "the room found, its host's name");
 	if (found)
 		lan_join(searcher->lan, &rooms[0]);
 	for (ticks = 0; ticks < 400 && (lan_role_of(searcher->lan) != LAN_IN_ROOM || lan_role_of(pair->lan) != LAN_IN_ROOM
@@ -246,6 +320,8 @@ int main(void)
 
 	for (int index = 0; index < DEVICES; index++)
 		lan_close(devices[index].lan);
+
+	rooms_by_seek();
 	printf(failures ? "%d failed\n" : "all passed\n", failures);
 	return failures ? 1 : 0;
 }

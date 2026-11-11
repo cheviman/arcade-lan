@@ -2,9 +2,9 @@
  *    Name:        lan_link_test.c
  *    Description: the library's test of a linked game (LAN_LINK): four devices in one program over 127.0.0.1, a
  *                 tenth of their datagrams lost
- *    Version:     0.1.0
+ *    Version:     0.2.0
  *    Created:     06-11-2026
- *    Modified:    06-11-2026
+ *    Modified:    11-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -12,8 +12,8 @@
  *    (the beacon, JOIN by it and by the address), what a device says of itself, the game's devices and every one's
  *    newest block on every other, a device that joins the room while the game goes on (not in it, in the next one),
  *    a device unheard (waited for, heard again), a device gone (out of the game and of the room; heard again, back in
- *    the room only), a device's LEAVE, the host's LEAVE (the next one hosts the room on, START again from it), and a
- *    host unheard for 3 seconds.
+ *    the room only), a device's LEAVE, the host's LEAVE (the next one hosts the room on, START again from it, and is
+ *    found by the SEEK of a device that hears no beacon), and a host unheard for 3 seconds.
  */
 #include "arcade_lan.h"
 
@@ -22,7 +22,8 @@
 #include <string.h>
 
 #define DEVICES             4
-#define BEACON_PORT         27732
+#define BEACON_PORT         27751      /* (its seeks' port the next, the library's choice) */
+#define DEAF_BEACON_PORT    27753      /* where a device listens that hears none of the room's beacons */
 #define CLOSE               30         /* frames: a block this near the device's own count is fresh */
 
 typedef struct
@@ -175,7 +176,7 @@ int main(void)
 		tick_all(1);
 		found = lan_rooms(searcher->lan, rooms);
 	}
-	check(found == 1 && strcmp(rooms[0].name, "HOST") == 0, "the room found by its beacon");
+	check(found == 1 && strcmp(rooms[0].name, "HOST") == 0, "the room found");
 	if (found)
 		lan_join(searcher->lan, &rooms[0]);
 	for (ticks = 0; ticks < 400 && lan_members(host->lan, members) != 3; ticks++)
@@ -265,6 +266,26 @@ int main(void)
 	tick_all(120);
 	game_names(late, text, sizeof(text));
 	check(late->started && strcmp(text, "SEARCHER LATE") == 0, "its game");
+
+	/* the room hosted on, found by a device that hears no beacon: the next host answers its SEEK */
+	{
+		lan_config deaf = config;
+		lan_device *seeker;
+
+		deaf.beacon_port = DEAF_BEACON_PORT;
+		deaf.seek_port = BEACON_PORT + 1;
+		seeker = lan_open(&deaf, "Seeker", 1);
+		lan_search(seeker);
+		for (ticks = 0, found = 0; ticks < 600 && !found; ticks++)
+		{
+			tick_all(1);
+			lan_update(seeker);
+			found = lan_rooms(seeker, rooms);
+		}
+		check(found == 1 && strcmp(rooms[0].name, "SEARCHER") == 0 && rooms[0].devices == 2 && !rooms[0].playing,
+			"the room hosted on found by a SEEK: it takes devices");
+		lan_close(seeker);
+	}
 
 	/* a host unheard for 3 seconds */
 	searcher->off = true;

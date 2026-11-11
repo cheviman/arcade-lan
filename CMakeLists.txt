@@ -9,6 +9,14 @@ set_target_properties(arcade_lan PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
 if(WIN32)
 	target_link_libraries(arcade_lan PUBLIC ws2_32)
 endif()
+
+# Where the system refuses UDP broadcasts (iOS without Apple's multicast entitlement): the rooms found by datagrams to
+# each address of the device's local networks. A port for an Apple system sets it before its add_subdirectory (the
+# library does not compile with it for another: src/lan_udp.c)
+option(ARCADE_LAN_NO_BROADCAST "Find the rooms without UDP broadcasts (iOS without the multicast entitlement)" OFF)
+if(ARCADE_LAN_NO_BROADCAST)
+	target_compile_definitions(arcade_lan PRIVATE ARCADE_LAN_NO_BROADCAST)
+endif()
 if(MSVC)
 	target_compile_options(arcade_lan PRIVATE /W4)
 	target_compile_definitions(arcade_lan PRIVATE _CRT_SECURE_NO_WARNINGS _WINSOCK_DEPRECATED_NO_WARNINGS)

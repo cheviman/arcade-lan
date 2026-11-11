@@ -1,14 +1,15 @@
 /**
  *    Name:        lan_udp.c
  *    Description: the library's sockets: UDP, non-blocking, on Windows (Winsock), the Switch (libnx's BSD sockets)
- *                 and the rest (POSIX: Linux, macOS, Android)
- *    Version:     0.1.0
+ *                 and the rest (POSIX: Linux, macOS, Android, iOS)
+ *    Version:     0.2.0
  *    Created:     06-11-2026
- *    Modified:    06-11-2026
+ *    Modified:    11-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
- *    outrunners-port's console/net_udp.c, each socket its caller's (several devices in one program: the tests).
+ *    outrunners-port's console/net_udp.c, each socket its caller's (several devices in one program: the tests). The
+ *    sweep is the one its iOS port had there (outrunners-port's pull request 14).
  */
 #include "lan_udp.h"
 
@@ -30,6 +31,22 @@
 #include <unistd.h>
 #define close_socket    close
 #endif
+
+/* The sweep (ARCADE_LAN_NO_BROADCAST) on Apple's systems alone, the ones that refuse broadcasts: it lists the device's
+   networks with getifaddrs, and most of its datagrams go to addresses no device has. Linux keeps each of those for 3
+   seconds, while it asks whose the address is, counted against its socket's send buffer, which the first sweep fills
+   (measured: 238 of its 254 datagrams sent, and none more from that socket for 3 seconds, to any address: a room's
+   list never left its host). Darwin's UDP keeps nothing in the socket's buffer; there the sweep was tried on iOS's
+   simulator, in outrunners-port's pull request 14, and not here */
+#ifdef ARCADE_LAN_NO_BROADCAST
+#ifndef __APPLE__
+#error "ARCADE_LAN_NO_BROADCAST is for Apple's systems (iOS without the multicast entitlement): see lan_udp.c"
+#endif
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
+
+#define SWEEP_ADDRESSES 256    /* of a local network: a larger one's, the /24 around this device */
 
 static bool started;
 
@@ -159,3 +176,53 @@ size_t lan_udp_receive(lan_socket socket, void *data, size_t room, lan_address *
 		return 0;
 	}
 }
+
+bool lan_udp_sweep_range(uint32_t ip, uint32_t mask, uint32_t *first, uint32_t *last)
+{
+	/* (a private address: a phone's cellular network, or any other, is not one whose devices are asked) */
+	if (ip >> 24 != 10u && ip >> 20 != 0xAC1u && ip >> 16 != 0xC0A8u)
+		return false;
+	if (~mask >= SWEEP_ADDRESSES)
+		mask = 0xFFFFFF00u;
+	*first = (ip & mask) + 1u;    /* (not the network's own address, nor its broadcast one) */
+	*last = (ip | ~mask) - 1u;
+	return *first <= *last;
+}
+
+#ifdef ARCADE_LAN_NO_BROADCAST
+void lan_udp_sweep(lan_socket socket, uint16_t port, const void *data, size_t size)
+{
+	struct ifaddrs *interfaces, *entry;
+
+	if (socket == LAN_NO_SOCKET || getifaddrs(&interfaces) != 0)
+		return;
+	for (entry = interfaces; entry; entry = entry->ifa_next)
+	{
+		uint32_t ip, mask, first, last;
+
+		if (!entry->ifa_addr || !entry->ifa_netmask || entry->ifa_addr->sa_family != AF_INET
+			|| !(entry->ifa_flags & IFF_UP) || !(entry->ifa_flags & IFF_BROADCAST))
+			continue;
+		ip = ntohl(((const struct sockaddr_in *)(const void *)entry->ifa_addr)->sin_addr.s_addr);
+		mask = ntohl(((const struct sockaddr_in *)(const void *)entry->ifa_netmask)->sin_addr.s_addr);
+		if (!lan_udp_sweep_range(ip, mask, &first, &last))
+			continue;
+		for (uint32_t address = first; address <= last; address++)
+		{
+			const lan_address to = { address, port };
+
+			if (address != ip)
+				lan_udp_send(socket, to, data, size);
+		}
+	}
+	freeifaddrs(interfaces);
+}
+#else
+void lan_udp_sweep(lan_socket socket, uint16_t port, const void *data, size_t size)
+{
+	(void)socket;
+	(void)port;
+	(void)data;
+	(void)size;
+}
+#endif

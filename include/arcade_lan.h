@@ -4,9 +4,9 @@
  *                 played in lockstep through the room's host (every device runs the same frames with every player's
  *                 inputs), or linked (each device runs its own game and sends the others a block of its own each
  *                 frame, as linked cabinets do)
- *    Version:     0.2.0
+ *    Version:     0.3.0
  *    Created:     06-11-2026
- *    Modified:    06-11-2026
+ *    Modified:    11-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -30,6 +30,11 @@
  *        lan_update(device); lan_set_status(device, what the game says of it, as its being in a race);
  *        lan_game_started(device, ...): the game linked, this device the game's device of its own (lan_game_members)
  *        in the game: lan_publish(device, its block); lan_block(device, n, block): the newest of the game's device n
+ *
+ *    Where the system refuses UDP broadcasts (iOS without Apple's multicast entitlement) a port builds the library
+ *    with ARCADE_LAN_NO_BROADCAST (CMake's option of that name; Apple's systems alone): the device then finds the
+ *    rooms, and its own is found, by datagrams to each address of its local networks (lan_config's seek_port,
+ *    lan_hold_sweep). Every device, built so or not, answers the devices that look for rooms that way.
  */
 #ifndef ARCADE_LAN_H
 #define ARCADE_LAN_H
@@ -68,6 +73,8 @@ typedef struct
 	                          LAN_DELAY_MOST (2 or 3 on a LAN: the datagrams have come by then) */
 	int loss;              /* for tests: the percent of its datagrams this device loses as it sends them */
 	lan_mode mode;         /* LAN_LOCKSTEP unless given */
+	uint16_t seek_port;    /* where a room's host hears the devices that look for rooms and hear no broadcast: the
+	                          port after beacon_port unless given */
 } lan_config;
 
 typedef struct lan_device lan_device;
@@ -162,6 +169,12 @@ bool lan_waiting(const lan_device *device, char name[LAN_NAME_LENGTH + 1]);
 /* The device's socket's port, and a room joined by its host's address (where no beacon comes: tests, some networks) */
 uint16_t lan_port(const lan_device *device);
 lan_room lan_room_at(lan_address host);
+
+/* Built with ARCADE_LAN_NO_BROADCAST, a room's host sends its beacon once a second to every other address of its
+   local networks, one by one (a /24's at most: some 250 datagrams): held while the game has something on that they
+   would get in the way of (LAN_LINK: a race, its room open all along; in lockstep the library holds it through the
+   game, whose room takes no one). Nothing in a library not built so */
+void lan_hold_sweep(lan_device *device, bool held);
 
 /* LAN_LINK: a byte of this device's own that the others see (lan_member's status): what the game says of it */
 void lan_set_status(lan_device *device, uint8_t status);
