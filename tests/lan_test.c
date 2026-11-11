@@ -202,6 +202,9 @@ static void rooms_by_seek(void)
 		&& !lan_udp_sweep_range(0xA9FE0001u, 0xFFFF0000u, &first, &last)
 		&& !lan_udp_sweep_range(0xC0A80101u, 0xFFFFFFFFu, &first, &last),
 		"none of a network that is not private, nor of an address alone");
+	check(lan_udp_local(0x7F000001u) && lan_udp_local(0xC0A80105u) && lan_udp_local(0x0A000001u)
+		&& lan_udp_local(0xAC100001u) && !lan_udp_local(0x08080808u) && !lan_udp_local(0xAC200001u)
+		&& !lan_udp_local(0xFFFFFFFFu), "a SEEK answered to this device's address or a private network's alone");
 }
 
 int main(void)

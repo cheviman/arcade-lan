@@ -21,7 +21,9 @@
  *    one (lan_udp_sweep). A room's host built so sends its beacon the same way once a second, to the beacons' port,
  *    unless the game holds it (lan_hold_sweep: a race) or plays in lockstep (its room takes no one then); from its
  *    own socket, as every beacon, which is where a device asks to JOIN. The beacon is the same and a SEEK is of no
- *    room, so a device without them takes neither for its own: the protocol's number stays.
+ *    room, so a device without them takes neither for its own: the protocol's number stays. A SEEK is answered only
+ *    at the seeks' port, to an address of a local network (a private one, or the device's own) and 16 times a second
+ *    at most: it is anyone's to send, under any address, and a host is not to be made to send its beacons elsewhere.
  *
  *    The game: at its START every device runs frame 0 on, each frame only once it has every slot's inputs for it. A
  *    device's players' controls given at a frame play 'delay' frames on (the first 'delay' frames have none); it sends
@@ -50,6 +52,7 @@
 #define LIST_FRAMES         30         /* and its list, to its devices */
 #define SEEK_FRAMES         60         /* a search's SEEK, every second */
 #define SWEEP_FRAMES        60         /* and a room's beacon to each address, where broadcasts are refused */
+#define SEEKS_ANSWERED      16         /* the SEEKs a host answers in a second, at most */
 #define ROOM_FORGOTTEN      180        /* a room unheard for 3 seconds is gone from the rooms found */
 #define JOIN_FRAMES         10         /* JOIN again until the room lists the device */
 #define JOIN_GIVEN_UP       300        /* a room that does not answer in 5 seconds */
@@ -150,6 +153,8 @@ struct lan_device
 	lan_address host_address;
 	uint32_t joining_since;
 	uint32_t seeking_since;    /* the clock when it began to look for rooms */
+	uint32_t answering_since;  /* the host's: the second its answers to SEEKs are counted in, */
+	int seeks_answered;        /* and how many */
 
 	/* the rooms found */
 	lan_room rooms[LAN_ROOMS];
@@ -594,11 +599,23 @@ static void sweep_beacon(lan_device *device)
 	lan_udp_sweep(device->socket, device->config.beacon_port, out.bytes, out.size);
 }
 
-/* The host: its beacon to a device that asks for it, at the address it asks from (its beacons' port) */
+/* The host: its beacon to a device that asks for it, at the address it asks from (its beacons' port). To a device of
+   a local network alone (a private address, or this device's), and so many a second: a SEEK is anyone's to send, with
+   any address as its own, and the host's answers are not to be sent to whoever that names */
 static void answer_seek(lan_device *device, lan_address to)
 {
 	writer out;
 
+	if (!lan_udp_local(to.ip))
+		return;
+	if (device->clock - device->answering_since >= SEEK_FRAMES)
+	{
+		device->answering_since = device->clock;
+		device->seeks_answered = 0;
+	}
+	if (device->seeks_answered >= SEEKS_ANSWERED)
+		return;
+	device->seeks_answered++;
 	put_beacon(device, &out);
 	send_datagram(device, to, &out);
 }
@@ -1175,8 +1192,12 @@ static void heard_block(lan_device *device, reader *in, uint32_t sender, lan_add
 	}
 }
 
-/* A datagram that came: 'finding', at the beacons' port or the seeks', where only those are taken */
-static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size, lan_address from, bool finding)
+/* Where a datagram came: the device's own socket, the beacons' port, the seeks' */
+typedef enum { AT_OWN, AT_BEACONS, AT_SEEKS } heard_at;
+
+/* A datagram that came: a beacon is taken at the beacons' port alone, a SEEK at the seeks', the rest at the device's
+   own socket */
+static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size, lan_address from, heard_at at_port)
 {
 	reader in = { bytes, size, 0, false };
 	int kind, index;
@@ -1194,17 +1215,17 @@ static void take_datagram(lan_device *device, const uint8_t *bytes, size_t size,
 		return;
 	if (kind == PACKET_BEACON)
 	{
-		if (finding && device->role == LAN_SEARCHING)
+		if (at_port == AT_BEACONS && device->role == LAN_SEARCHING)
 			heard_beacon(device, &in, room, from);
 		return;
 	}
 	if (kind == PACKET_SEEK)
 	{
-		if (lan_hosting(device))
+		if (at_port == AT_SEEKS && lan_hosting(device))
 			answer_seek(device, from);
 		return;
 	}
-	if (finding)
+	if (at_port != AT_OWN)
 		return;
 	if (lan_hosting(device))
 	{
@@ -1373,11 +1394,11 @@ void lan_update(lan_device *device)
 		return;
 	device->clock++;
 	while ((size = lan_udp_receive(device->socket, bytes, sizeof(bytes), &from)) > 0)
-		take_datagram(device, bytes, size, from, false);
+		take_datagram(device, bytes, size, from, AT_OWN);
 	while ((size = lan_udp_receive(device->beacon_socket, bytes, sizeof(bytes), &from)) > 0)
-		take_datagram(device, bytes, size, from, true);
+		take_datagram(device, bytes, size, from, AT_BEACONS);
 	while ((size = lan_udp_receive(device->seek_socket, bytes, sizeof(bytes), &from)) > 0)
-		take_datagram(device, bytes, size, from, true);
+		take_datagram(device, bytes, size, from, AT_SEEKS);
 
 	switch (device->role)
 	{

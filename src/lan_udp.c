@@ -177,10 +177,20 @@ size_t lan_udp_receive(lan_socket socket, void *data, size_t room, lan_address *
 	}
 }
 
+bool lan_udp_private(uint32_t ip)
+{
+	return ip >> 24 == 10u || ip >> 20 == 0xAC1u || ip >> 16 == 0xC0A8u;
+}
+
+bool lan_udp_local(uint32_t ip)
+{
+	return ip >> 24 == 127u || lan_udp_private(ip);
+}
+
 bool lan_udp_sweep_range(uint32_t ip, uint32_t mask, uint32_t *first, uint32_t *last)
 {
 	/* (a private address: a phone's cellular network, or any other, is not one whose devices are asked) */
-	if (ip >> 24 != 10u && ip >> 20 != 0xAC1u && ip >> 16 != 0xC0A8u)
+	if (!lan_udp_private(ip))
 		return false;
 	if (~mask >= SWEEP_ADDRESSES)
 		mask = 0xFFFFFF00u;

@@ -42,6 +42,11 @@ size_t lan_udp_receive(lan_socket socket, void *data, size_t room, lan_address *
    one. Nothing elsewhere, where LAN_BROADCAST reaches them */
 void lan_udp_sweep(lan_socket socket, uint16_t port, const void *data, size_t size);
 
+/* An address of a private network (10.x, 172.16-31.x, 192.168.x); one of those or of this device (127.x): the ones a
+   SEEK is answered to */
+bool lan_udp_private(uint32_t ip);
+bool lan_udp_local(uint32_t ip);
+
 /* The addresses a sweep goes to, 'first' to 'last', on the network of the device's address 'ip' and its 'mask': a
    private network's alone (10.x, 172.16-31.x, 192.168.x), and of one larger than a /24 the /24 around the device;
    false where there are none */

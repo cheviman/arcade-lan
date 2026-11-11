@@ -113,6 +113,9 @@ find their rooms. `lan_config`'s last member, `seek_port`, is the port those dev
   holds it (`lan_hold_sweep`). The beacon is the same as before and a SEEK is of no room, so the protocol's number
   did not change: a device with a library before the seeks plays with one after them, and only does not answer a
   SEEK (a device that hears no broadcast does not find the room it hosts, and its own room is found by its sweep).
+  A host answers a SEEK only at the seeks' port, to an address of a local network (a private one, or the device's
+  own) and 16 times a second at most: a SEEK is anyone's to send, under any address, and the answer is a datagram
+  twice its size.
   The sweep is Darwin's alone: most of its datagrams go to addresses no device has, which Linux keeps for 3 seconds
   each, counted against the socket they came from, and the first sweep leaves that socket unable to send (measured:
   238 of the 254 sent, and nothing more for 3 seconds).
